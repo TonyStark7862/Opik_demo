@@ -3,37 +3,117 @@ import pandas as pd
 import os
 import time
 from streamlit_autorefresh import st_autorefresh
-
-# --- Evidently AI Imports ---
-from evidently import ColumnMapping
-from evidently.report import Report
-from evidently.test_suite import TestSuite
-# Import metrics and tests to build reports/suites manually
-from evidently.metric_preset import DataSummary # To get column summaries
-from evidently.metrics import ColumnSummaryMetric, ColumnValuePlot # Examples
-from evidently.tests import * # Import all tests for flexibility
+import numpy as np
 
 # --- Configuration ---
-CSV_FILE = 'interactions.csv'
+CSV_FILE = 'interactions_manual.csv' # Match the name used in app_manual.py
 REFRESH_INTERVAL_SECONDS = 10 # Auto-refresh interval
 
 # --- Helper Function to load data ---
-@st.cache_data(ttl=REFRESH_INTERVAL_SECONDS) # Cache data for short period
+# Cache data for short period to avoid re-reading constantly
+@st.cache_data(ttl=REFRESH_INTERVAL_SECONDS)
 def load_data(file_path):
     if os.path.exists(file_path):
         try:
-            return pd.read_csv(file_path)
+            # Specify low_memory=False for potentially mixed types or large files
+            df = pd.read_csv(file_path, low_memory=False)
+            # Attempt to convert timestamp column
+            if 'timestamp' in df.columns:
+                df['timestamp_dt'] = pd.to_datetime(df['timestamp'], errors='coerce')
+            return df
         except pd.errors.EmptyDataError:
+            st.info(f"'{file_path}' is empty.")
             return pd.DataFrame() # Return empty df if file is empty
         except Exception as e:
-            st.error(f"Error loading data: {e}")
+            st.error(f"Error loading data from '{file_path}': {e}")
             return pd.DataFrame()
     else:
+        # st.info(f"Data file '{file_path}' not found.")
         return pd.DataFrame()
+
+# --- Manual Test Functions ---
+def run_manual_tests(df):
+    results = {}
+    if df.empty:
+        return results
+
+    # Test: Average Latency
+    if 'latency_ms' in df.columns:
+        avg_latency = df['latency_ms'].mean()
+        results['Avg Latency < 2000ms'] = {
+            'value': f"{avg_latency:.0f} ms",
+            'pass': avg_latency < 2000,
+            'is_critical': False
+        }
+
+    # Test: Semantic Similarity
+    if 'semantic_similarity_prompt_answer' in df.columns:
+         # Only test if there are valid (non-NA) scores
+        valid_scores = df['semantic_similarity_prompt_answer'].dropna()
+        if not valid_scores.empty:
+            avg_similarity = valid_scores.mean()
+            results['Avg Semantic Similarity >= 0.3'] = {
+                'value': f"{avg_similarity:.3f}",
+                'pass': avg_similarity >= 0.3,
+                'is_critical': False
+            }
+        else:
+             results['Avg Semantic Similarity >= 0.3'] = {
+                  'value': "N/A", 'pass': None, 'is_critical': False # Indicate test didn't run
+             }
+
+
+    # Test: Toxicity Rate
+    if 'custom_toxicity_label' in df.columns:
+        toxic_rate = (df['custom_toxicity_label'].str.lower() == 'toxic').mean()
+        results['Toxicity Rate <= 10%'] = {
+            'value': f"{toxic_rate:.1%}",
+            'pass': toxic_rate <= 0.10,
+            'is_critical': True
+        }
+
+    # Test: PII Detection Rate
+    if 'custom_pii_label' in df.columns:
+        pii_rate = (df['custom_pii_label'].str.lower() == 'pii detected').mean()
+        results['PII Rate == 0%'] = {
+            'value': f"{pii_rate:.1%}",
+            'pass': pii_rate == 0.0,
+            'is_critical': True
+        }
+
+    # Test: Decline Rate
+    if 'custom_decline_label' in df.columns:
+        decline_rate = (df['custom_decline_label'].str.lower() == 'declined').mean()
+        results['Decline Rate <= 15%'] = {
+            'value': f"{decline_rate:.1%}",
+            'pass': decline_rate <= 0.15,
+            'is_critical': False
+        }
+
+    # Test: Relevance (Irrelevant Rate)
+    if 'custom_relevance_label' in df.columns:
+         irr_rate = (df['custom_relevance_label'].str.lower() == 'irrelevant').mean()
+         results['Irrelevant Rate <= 20%'] = {
+              'value': f"{irr_rate:.1%}",
+              'pass': irr_rate <= 0.20,
+              'is_critical': False
+         }
+
+    # Test: Compliance Rate
+    if 'custom_compliance_label' in df.columns:
+         non_comp_rate = (df['custom_compliance_label'].str.lower() == 'not compliant').mean()
+         results['Non-Compliance Rate == 0%'] = {
+              'value': f"{non_comp_rate:.1%}",
+              'pass': non_comp_rate == 0.0,
+              'is_critical': True
+         }
+
+    return results
+
 
 # --- Main Dashboard Logic ---
 st.set_page_config(layout="wide")
-st.title("📊 LLM Observability Dashboard (Evidently AI)")
+st.title("📊 LLM Observability Dashboard (Manual Implementation)")
 
 # Auto-refresh controller
 refresh_count = st_autorefresh(interval=REFRESH_INTERVAL_SECONDS * 1000, key="dashboard_refresh")
@@ -45,151 +125,121 @@ if data_df.empty:
     st.warning(f"No interaction data found yet in '{CSV_FILE}'. Please interact with the chat app.")
 else:
     st.success(f"Loaded {len(data_df)} interactions. Last refresh: {time.strftime('%H:%M:%S')}")
-    st.dataframe(data_df.tail())
 
-    # --- Define Column Mapping for Evidently ---
-    # Dynamically create mapping based on columns present in the loaded CSV
-    # This makes it robust to which evaluations were successful in app.py
-    numerical_cols = data_df.select_dtypes(include=['number']).columns.tolist()
-    categorical_cols = data_df.select_dtypes(include=['object', 'category']).columns.tolist()
-    # Remove columns we don't want treated purely as categorical for typical reports
-    # (adjust based on specific needs)
-    cols_to_remove_from_cat = ['session_id', 'interaction_id', 'timestamp', 'prompt', 'answer']
-    # Identify custom eval columns that should be treated as categorical
-    custom_label_cols = [col for col in data_df.columns if col.endswith('_label')]
+    tab1, tab2, tab3 = st.tabs(["📋 Test Results", "📈 Metrics Overview", "📄 Raw Data"])
 
-    categorical_cols = [
-        col for col in categorical_cols
-        if col not in cols_to_remove_from_cat and col not in custom_label_cols
-    ] + custom_label_cols # Ensure custom labels are categorical
-
-    # Example: Manually specify if needed, but dynamic is safer
-    column_mapping = ColumnMapping()
-    # Let Evidently handle defaults for numerical/categorical, but you could map explicitly:
-    # column_mapping.numerical_features = [...]
-    # column_mapping.categorical_features = [...]
-
-
-    # --- Generate Evidently Report ---
-    st.header("Evidently Report")
-    report_placeholder = st.empty()
-    report_placeholder.info("Generating report...")
-
-    try:
-        # Build report manually with desired metrics
-        report = Report(metrics=[
-            DataSummary(), # Overall dataset stats
-            ColumnSummaryMetric(column_name="latency_ms"),
-            ColumnSummaryMetric(column_name="text_length_answer"),
-            ColumnSummaryMetric(column_name="semantic_similarity_prompt_answer"),
-            ColumnSummaryMetric(column_name="custom_sentiment_score"), # For custom score
-            # Add summaries for custom labels (will show counts/frequencies)
-            ColumnSummaryMetric(column_name="custom_toxicity_label"),
-            ColumnSummaryMetric(column_name="custom_relevance_label"),
-            ColumnSummaryMetric(column_name="custom_pii_label"),
-            ColumnSummaryMetric(column_name="custom_decline_label"),
-            ColumnSummaryMetric(column_name="custom_bias_label"),
-            ColumnSummaryMetric(column_name="custom_compliance_label"),
-            # Add more specific plots if desired
-            # ColumnValuePlot(column_name="latency_ms"),
-            # ColumnValuePlot(column_name="semantic_similarity_prompt_answer"),
-        ])
-        report.run(current_data=data_df, reference_data=None, column_mapping=column_mapping)
-
-        # Save report to HTML
-        report_path = "evidently_report.html"
-        report.save_html(report_path)
-
-        # Display HTML report in Streamlit
-        with open(report_path, 'r', encoding='utf-8') as f:
-            html_content = f.read()
-        report_placeholder.empty() # Clear the 'generating' message
-        with st.expander("View Full Evidently Report", expanded=True):
-            st.components.v1.html(html_content, height=600, scrolling=True)
-
-    except Exception as e:
-        report_placeholder.error(f"Failed to generate Evidently Report: {e}")
-        st.exception(e) # Show full traceback for debugging
-
-    # --- Generate Evidently Test Suite ---
-    st.header("Evidently Test Suite")
-    test_suite_placeholder = st.empty()
-    test_suite_placeholder.info("Generating test suite...")
-
-    try:
-        # Define tests based on available columns
-        tests_to_run = []
-        if "latency_ms" in data_df.columns:
-            tests_to_run.append(TestMeanValue(column_name="latency_ms", lte=2000, is_critical=False)) # Warning if avg latency > 2s
-        if "text_length_answer" in data_df.columns:
-            tests_to_run.append(TestMeanValue(column_name="text_length_answer", gte=10)) # Must have some length
-            tests_to_run.append(TestMeanValue(column_name="text_length_answer", lte=1000, is_critical=False)) # Warn if too long avg
-        if "semantic_similarity_prompt_answer" in data_df.columns:
-             # Check if column has non-NA values before testing
-            if data_df["semantic_similarity_prompt_answer"].notna().any():
-                 tests_to_run.append(TestMeanValue(column_name="semantic_similarity_prompt_answer", gte=0.3, is_critical=False)) # Warn if avg similarity is low
-            else:
-                 st.caption("Skipping Semantic Similarity tests as column contains only NA values.")
-
-        if "custom_sentiment_score" in data_df.columns and data_df["custom_sentiment_score"].notna().any():
-            tests_to_run.append(TestMeanValue(column_name="custom_sentiment_score", gte=0.0)) # Avg sentiment should be non-negative
-        if "custom_toxicity_label" in data_df.columns:
-            tests_to_run.append(TestCategoryShare(column_name="custom_toxicity_label", category="Toxic", lte=0.1)) # Less than 10% toxic
-        if "custom_relevance_label" in data_df.columns:
-            tests_to_run.append(TestCategoryShare(column_name="custom_relevance_label", category="Irrelevant", lte=0.2, is_critical=False)) # Warn if > 20% irrelevant
-        if "custom_pii_label" in data_df.columns:
-             tests_to_run.append(TestCategoryShare(column_name="custom_pii_label", category="PII Detected", eq=0)) # Should be 0 PII detected
-        if "custom_decline_label" in data_df.columns:
-            tests_to_run.append(TestCategoryShare(column_name="custom_decline_label", category="Declined", lte=0.15, is_critical=False)) # Warn if > 15% declined
-        if "custom_bias_label" in data_df.columns:
-            tests_to_run.append(TestCategoryShare(column_name="custom_bias_label", category="Bias Detected", lte=0.05)) # Less than 5% biased
-        if "custom_compliance_label" in data_df.columns:
-            tests_to_run.append(TestCategoryShare(column_name="custom_compliance_label", category="Not Compliant", eq=0)) # Should be 0 non-compliant
-
-
-        if tests_to_run:
-            test_suite = TestSuite(tests=tests_to_run)
-            test_suite.run(current_data=data_df, reference_data=None, column_mapping=column_mapping)
-
-            # Save test suite to HTML
-            test_suite_path = "evidently_tests.html"
-            test_suite.save_html(test_suite_path)
-
-            # Display HTML test suite in Streamlit
-            with open(test_suite_path, 'r', encoding='utf-8') as f:
-                html_content_tests = f.read()
-            test_suite_placeholder.empty() # Clear the 'generating' message
-            with st.expander("View Full Evidently Test Suite Results", expanded=True):
-                st.components.v1.html(html_content_tests, height=600, scrolling=True)
+    with tab1:
+        st.subheader("Manual Test Suite Results")
+        test_results = run_manual_tests(data_df)
+        if not test_results:
+            st.info("No tests could be run on the current data.")
         else:
-             test_suite_placeholder.warning("No applicable tests could be configured based on available data columns.")
+            num_failed = sum(1 for r in test_results.values() if r['pass'] is False)
+            num_warning = sum(1 for r in test_results.values() if r['pass'] is False and not r['is_critical'])
+            num_passed = sum(1 for r in test_results.values() if r['pass'] is True)
+            num_nodata = sum(1 for r in test_results.values() if r['pass'] is None)
 
 
-    except Exception as e:
-        test_suite_placeholder.error(f"Failed to generate Evidently Test Suite: {e}")
-        st.exception(e) # Show full traceback for debugging
+            st.metric("Failed Critical Tests", num_failed - num_warning)
+            st.metric("Warnings (Failed Non-Critical)", num_warning)
+            st.metric("Passed Tests", num_passed)
 
-    # --- Optional: Add specific Streamlit plots/metrics ---
-    st.header("Key Metrics Overview")
-    col1, col2, col3 = st.columns(3)
-    if "latency_ms" in data_df.columns:
-        avg_latency = data_df["latency_ms"].mean()
-        col1.metric("Avg Latency (ms)", f"{avg_latency:.2f}")
-    if "custom_toxicity_label" in data_df.columns:
-        toxic_count = (data_df["custom_toxicity_label"] == "Toxic").sum()
-        col2.metric("Toxic Responses Count", f"{toxic_count}")
-    if "semantic_similarity_prompt_answer" in data_df.columns:
-        avg_similarity = data_df["semantic_similarity_prompt_answer"].mean() # Might be NaN if all failed
-        col3.metric("Avg Semantic Similarity", f"{avg_similarity:.3f}" if pd.notna(avg_similarity) else "N/A")
 
-    st.subheader("Latency Over Time")
-    if "timestamp" in data_df.columns and "latency_ms" in data_df.columns:
-        # Convert timestamp if it's not already datetime
-        if not pd.api.types.is_datetime64_any_dtype(data_df['timestamp']):
-             try:
-                 data_df['timestamp_dt'] = pd.to_datetime(data_df['timestamp'])
-                 st.line_chart(data_df.set_index('timestamp_dt')['latency_ms'])
-             except Exception as e:
-                 st.warning(f"Could not parse timestamp for chart: {e}")
+            results_df = pd.DataFrame([
+                {'Test': name, 'Result': 'PASS' if r['pass'] else ('FAIL' if r['pass'] is False else 'NO DATA'), 'Value': r['value'], 'Critical': r['is_critical']}
+                for name, r in test_results.items()
+            ])
+
+            # Color rows based on pass/fail
+            def color_result(row):
+                if row['Result'] == 'FAIL':
+                    color = 'background-color: #FFCCCB' # Light Red
+                    if row['Critical'] == False:
+                         color = 'background-color: #FFFFE0' # Light Yellow (Warning)
+                elif row['Result'] == 'PASS':
+                    color = 'background-color: #90EE90' # Light Green
+                else: # NO DATA
+                     color = 'background-color: #D3D3D3' # Light Grey
+                return [color] * len(row)
+
+            st.dataframe(results_df.style.apply(color_result, axis=1), use_container_width=True)
+
+
+    with tab2:
+        st.subheader("Key Metrics Summary")
+        # Display metrics using st.metric or plots
+        col1, col2, col3, col4 = st.columns(4)
+
+        if 'latency_ms' in data_df.columns:
+            avg_latency = data_df['latency_ms'].mean()
+            col1.metric("Avg Latency (ms)", f"{avg_latency:.0f}")
         else:
-             st.line_chart(data_df.set_index('timestamp')['latency_ms'])
+            col1.metric("Avg Latency (ms)", "N/A")
+
+        if 'custom_sentiment_score' in data_df.columns:
+             avg_sent = data_df['custom_sentiment_score'].mean()
+             col2.metric("Avg Sentiment Score", f"{avg_sent:.2f}" if pd.notna(avg_sent) else "N/A")
+        else:
+             col2.metric("Avg Sentiment Score", "N/A")
+
+        if 'semantic_similarity_prompt_answer' in data_df.columns:
+            avg_sim = data_df['semantic_similarity_prompt_answer'].mean()
+            col3.metric("Avg Sem. Similarity", f"{avg_sim:.3f}" if pd.notna(avg_sim) else "N/A")
+        else:
+            col3.metric("Avg Sem. Similarity", "N/A")
+
+        if 'custom_toxicity_label' in data_df.columns:
+            toxic_rate = (data_df['custom_toxicity_label'].str.lower() == 'toxic').mean() * 100
+            col4.metric("Toxicity Rate", f"{toxic_rate:.1f}%")
+        else:
+             col4.metric("Toxicity Rate", "N/A")
+
+        st.divider()
+
+        # Plot some time series data if timestamp exists
+        if 'timestamp_dt' in data_df.columns and data_df['timestamp_dt'].notna().any():
+             df_sorted = data_df.sort_values('timestamp_dt').set_index('timestamp_dt')
+
+             st.subheader("Metrics Over Time")
+             cols_to_plot = [
+                 'latency_ms',
+                 'text_length_answer',
+                 'semantic_similarity_prompt_answer',
+                 'custom_sentiment_score',
+                 'custom_toxicity_score', # Plotting the 0/1 score
+                 'custom_pii_score',
+                 'custom_decline_score',
+                 'custom_bias_score',
+                 'custom_compliance_score'
+                 ]
+             # Filter out columns that don't exist or are all NA
+             plot_cols_exist = [col for col in cols_to_plot if col in df_sorted.columns and df_sorted[col].notna().any()]
+
+             if plot_cols_exist:
+                 st.line_chart(df_sorted[plot_cols_exist])
+             else:
+                 st.info("Not enough data or columns available to plot time series metrics.")
+
+             st.subheader("Label Distributions")
+             label_cols = [col for col in data_df.columns if col.endswith('_label')]
+             if label_cols:
+                 for col_name in label_cols:
+                      st.write(f"**{col_name.replace('_', ' ').title()} Distribution:**")
+                      # Calculate value counts and handle potential NaN/None labels
+                      counts = data_df[col_name].fillna('Unknown').value_counts()
+                      if not counts.empty:
+                           st.bar_chart(counts)
+                      else:
+                           st.caption("No data available for this label.")
+             else:
+                  st.info("No label columns found for distribution plots.")
+
+
+        else:
+            st.info("Timestamp column missing or invalid, cannot plot time series.")
+
+
+    with tab3:
+        st.subheader("Raw Interaction Data")
+        # Provide filtering options maybe? For now, just display tail.
+        st.dataframe(data_df, use_container_width=True)
