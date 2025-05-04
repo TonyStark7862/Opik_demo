@@ -15,35 +15,52 @@ REFRESH_INTERVAL_SECONDS = 10 # Auto-refresh interval
 def load_data(file_path):
     if os.path.exists(file_path):
         try:
-            df = pd.read_csv(file_path, low_memory=False, na_values=['NA', '']) # Read 'NA' back as NaN
+            # Specify low_memory=False for potentially mixed types or large files
+            # Read 'NA' strings back as actual NaN values
+            df = pd.read_csv(file_path, low_memory=False, na_values=['NA', ''])
             # Convert timestamp column
             if 'timestamp' in df.columns:
                 df['timestamp_dt'] = pd.to_datetime(df['timestamp'], errors='coerce')
-            # Convert potential numeric columns (handle errors -> NaN)
+
+            # --- Attempt Type Conversions ---
             numeric_cols = [
                 'latency_ms', 'text_length_answer', 'word_count_answer', 'sentence_count_answer',
                 'semantic_similarity_prompt_answer', 'custom_sentiment_score',
                 'custom_toxicity_score', 'custom_pii_score', 'custom_decline_score',
                 'custom_bias_score', 'custom_compliance_score'
             ]
+            bool_cols = ['contains_link_answer', 'is_valid_json_answer', 'contains_sorry_keywords', 'ends_with_period']
+
             for col in numeric_cols:
                 if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors='coerce')
-            # Convert potential boolean columns
-            bool_cols = ['contains_link_answer', 'is_valid_json_answer', 'contains_sorry_keywords', 'ends_with_period']
+                    df[col] = pd.to_numeric(df[col], errors='coerce') # Coerce errors to NaN
+
             for col in bool_cols:
                  if col in df.columns:
-                      # Map various string representations to boolean, default to False if conversion fails
-                      df[col] = df[col].astype(str).str.lower().map({'true': True, 'false': False, '1': True, '0': False, '1.0': True, '0.0': False}).fillna(False).astype(bool)
+                      # Map various string representations to boolean, default to False if conversion fails or NaN
+                      df[col] = df[col].astype(str).str.lower().map(
+                          {'true': True, 'false': False, '1': True, '0': False, '1.0': True, '0.0': False}
+                      ).fillna(False).astype(bool)
+
+            # Clean up potential 'nan'/'None' strings in error column if it exists
+            if 'evidently_error' in df.columns:
+                 df['evidently_error'] = df['evidently_error'].astype(str).replace(['nan', 'None'], '', regex=False)
+
+            # Fill NaNs from coercion in numeric cols with pd.NA for better handling downstream
+            # df[numeric_cols] = df[numeric_cols].fillna(pd.NA) # Keep as NaN for calculations
+            # Fill remaining empty strings in object columns if desired (or keep as is)
+            # df = df.fillna('') # Example: fill all remaining NaNs with empty string
 
             return df
+
         except pd.errors.EmptyDataError:
             st.info(f"'{file_path}' is empty.")
-            return pd.DataFrame()
+            return pd.DataFrame() # Return empty df if file is empty
         except Exception as e:
-            st.error(f"Error loading data from '{file_path}': {e}")
+            st.error(f"Error loading or processing data from '{file_path}': {e}")
             return pd.DataFrame()
     else:
+        # st.info(f"Data file '{file_path}' not found.")
         return pd.DataFrame()
 
 # --- Manual Test Functions ---
@@ -53,11 +70,22 @@ def run_manual_tests(df):
 
     # Helper to format test results
     def format_test(name, value, condition_met, is_critical=False, value_format="{:.2f}"):
+         # Handle None or NaN for value before formatting
+         if pd.isna(value) or value is None:
+              display_value = "N/A"
+         elif isinstance(value, (int, float)):
+              try:
+                   display_value = value_format.format(value)
+              except (ValueError, TypeError):
+                   display_value = str(value) # Fallback to string if format fails
+         else:
+              display_value = str(value)
+
          return {
               'Test': name,
               'Result': 'PASS' if condition_met else ('FAIL' if condition_met is False else 'NO DATA'),
-              'Value': value_format.format(value) if isinstance(value, (int, float)) and condition_met is not None else str(value),
-              'Pass': condition_met,
+              'Value': display_value,
+              'Pass': condition_met, # Keep boolean or None
               'Critical': is_critical
          }
 
@@ -65,46 +93,73 @@ def run_manual_tests(df):
     if 'latency_ms' in df.columns and df['latency_ms'].notna().any():
         avg_latency = df['latency_ms'].mean()
         results['Avg Latency < 2000ms'] = format_test('Avg Latency < 2000ms', avg_latency, avg_latency < 2000, False, "{:.0f} ms")
+    else:
+         results['Avg Latency < 2000ms'] = format_test('Avg Latency < 2000ms', None, None, False)
+
 
     # Test: Semantic Similarity
     if 'semantic_similarity_prompt_answer' in df.columns and df['semantic_similarity_prompt_answer'].notna().any():
         avg_similarity = df['semantic_similarity_prompt_answer'].mean()
         results = format_test('Avg Semantic Similarity >= 0.3', avg_similarity, avg_similarity >= 0.3, False, "{:.3f}")
+    else:
+         results = format_test('Avg Semantic Similarity >= 0.3', None, None, False)
+
 
     # Test: Toxicity Rate (using custom score 0/1)
     if 'custom_toxicity_score' in df.columns and df['custom_toxicity_score'].notna().any():
         toxic_rate = df['custom_toxicity_score'].mean() # Avg of 0/1 gives rate
         results = format_test('Toxicity Rate <= 10%', toxic_rate, toxic_rate <= 0.10, True, "{:.1%}")
+    else:
+         results = format_test('Toxicity Rate <= 10%', None, None, True)
+
 
     # Test: PII Detection Rate (using custom score 0/1)
     if 'custom_pii_score' in df.columns and df['custom_pii_score'].notna().any():
         pii_rate = df['custom_pii_score'].mean()
         results = format_test('PII Rate == 0%', pii_rate, pii_rate == 0.0, True, "{:.1%}")
+    else:
+         results = format_test('PII Rate == 0%', None, None, True)
+
 
     # Test: Decline Rate (using custom score 0/1)
     if 'custom_decline_score' in df.columns and df['custom_decline_score'].notna().any():
         decline_rate = df['custom_decline_score'].mean()
         results = format_test('Decline Rate <= 15%', decline_rate, decline_rate <= 0.15, False, "{:.1%}")
+    else:
+         results = format_test('Decline Rate <= 15%', None, None, False)
+
 
     # Test: Relevance (Irrelevant Rate - check label)
     if 'custom_relevance_label' in df.columns:
-        irr_rate = (df['custom_relevance_label'].astype(str).str.lower() == 'irrelevant').mean()
+        # Handle potential NaN/None before string operations
+        irr_rate = (df['custom_relevance_label'].fillna('').astype(str).str.lower() == 'irrelevant').mean()
         results = format_test('Irrelevant Rate <= 20%', irr_rate, irr_rate <= 0.20, False, "{:.1%}")
+    else:
+         results = format_test('Irrelevant Rate <= 20%', None, None, False)
+
 
     # Test: Compliance Rate (using custom score 0/1)
     if 'custom_compliance_score' in df.columns and df['custom_compliance_score'].notna().any():
         comp_rate = df['custom_compliance_score'].mean() # Avg of 0/1 where 1=compliant
         results = format_test('Compliance Rate >= 99%', comp_rate, comp_rate >= 0.99, True, "{:.1%}")
+    else:
+         results = format_test('Compliance Rate >= 99%', None, None, True)
+
 
     # Test: Contains Link Rate
     if 'contains_link_answer' in df.columns:
          link_rate = df['contains_link_answer'].mean() # Avg of True/False (1/0)
          results = format_test('Link Rate <= 30%', link_rate, link_rate <= 0.30, False, "{:.1%}")
+    else:
+         results = format_test('Link Rate <= 30%', None, None, False)
+
 
     # Test: Valid JSON Rate
     if 'is_valid_json_answer' in df.columns:
          valid_json_rate = df['is_valid_json_answer'].mean()
          results = format_test('Valid JSON Rate >= 95%', valid_json_rate, valid_json_rate >= 0.95, False, "{:.1%}")
+    else:
+         results = format_test('Valid JSON Rate >= 95%', None, None, False)
 
 
     return results
@@ -139,12 +194,14 @@ else:
             no_data = sum(1 for r in test_results.values() if r['Pass'] is None)
             total_tests = len(test_results)
 
-            st.metric("Total Tests Run", total_tests)
-            st.metric("Passed", passes)
-            st.metric("Failed (Critical)", fails_critical)
-            st.metric("Warnings (Failed Non-Critical)", fails_warning)
+            col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+            col_m1.metric("Total Tests Run", total_tests)
+            col_m2.metric("Passed", passes)
+            col_m3.metric("Failed (Critical)", fails_critical)
+            col_m4.metric("Warnings (Failed Non-Critical)", fails_warning)
             # st.metric("No Data / Skipped", no_data) # Optional
 
+            # Convert results dict to DataFrame for display
             results_display_df = pd.DataFrame(test_results.values())
 
             # Color rows based on pass/fail
@@ -156,10 +213,14 @@ else:
                          color = 'background-color: #FFFFE0' # Light Yellow (Warning)
                 elif row == 'PASS':
                     color = 'background-color: #90EE90' # Light Green (PASS)
+                # Apply the style to all columns in the row
                 return [color] * len(row)
 
+            # Select and rename columns for better display
+            display_test_df = results_display_df]
+
             st.dataframe(
-                results_display_df].style.apply(color_result, axis=1),
+                display_test_df.style.apply(color_result, axis=1),
                 use_container_width=True,
                 hide_index=True
             )
@@ -192,6 +253,7 @@ else:
 
         # Plot some time series data if timestamp exists
         if 'timestamp_dt' in data_df.columns and data_df['timestamp_dt'].notna().any():
+             # Drop rows where timestamp couldn't be parsed
              df_plot = data_df.dropna(subset=['timestamp_dt']).sort_values('timestamp_dt')
 
              st.subheader("Metrics Over Time")
@@ -202,33 +264,30 @@ else:
                  'custom_toxicity_score', 'custom_pii_score', 'custom_decline_score',
                  'custom_bias_score', 'custom_compliance_score'
              ]
+             # Filter out columns that don't exist or are all NA
              plot_cols_exist = [col for col in numeric_plot_cols if col in df_plot.columns and df_plot[col].notna().any()]
 
              if plot_cols_exist:
                  # Use Altair for better control over tooltips and axes
-                 base = alt.Chart(df_plot).encode(x='timestamp_dt:T')
-                 charts =
-                 for col in plot_cols_exist:
-                      chart = base.mark_line(point=True).encode(
-                           y=alt.Y(col, axis=alt.Axis(title=col.replace('_', ' ').title())),
-                           tooltip=
-                      ).properties(
-                           title=f'{col.replace("_", " ").title()} Trend'
-                      )
-                      charts.append(chart)
-
-                 # Combine charts vertically or allow selection
-                 # st.altair_chart(alt.vconcat(*charts), use_container_width=True) # Might be too tall
                  selected_metric = st.selectbox("Select Metric to Plot Trend:", plot_cols_exist)
                  if selected_metric:
-                      selected_chart = base.mark_line(point=True).encode(
-                           y=alt.Y(selected_metric, axis=alt.Axis(title=selected_metric.replace('_', ' ').title())),
-                           tooltip=
-                      ).properties(
-                           title=f'{selected_metric.replace("_", " ").title()} Trend'
-                      ).interactive() # Add zooming/panning
-                      st.altair_chart(selected_chart, use_container_width=True)
+                      # Ensure the selected column has numeric data for plotting
+                      if pd.api.types.is_numeric_dtype(df_plot[selected_metric]):
+                           base = alt.Chart(df_plot).encode(x='timestamp_dt:T')
+                           tooltip_cols =
+                           # Add prompt/answer to tooltip if they exist
+                           if 'prompt' in df_plot.columns: tooltip_cols.append('prompt:N')
+                           if 'answer' in df_plot.columns: tooltip_cols.append('answer:N')
 
+                           selected_chart = base.mark_line(point=True).encode(
+                                y=alt.Y(selected_metric, axis=alt.Axis(title=selected_metric.replace('_', ' ').title())),
+                                tooltip=tooltip_cols
+                           ).properties(
+                                title=f'{selected_metric.replace("_", " ").title()} Trend'
+                           ).interactive() # Add zooming/panning
+                           st.altair_chart(selected_chart, use_container_width=True)
+                      else:
+                           st.warning(f"Selected column '{selected_metric}' is not numeric and cannot be plotted as a line chart.")
              else:
                  st.info("Not enough numeric data or columns available to plot time series metrics.")
 
